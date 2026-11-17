@@ -378,26 +378,54 @@ export interface ReadPackResult {
   deltaCount: number;
 }
 
-/** Adler-32, the checksum a zlib stream ends with (big-endian, the last four stream bytes). */
+/**
+ * Adler-32, the checksum a zlib stream ends with (big-endian, the last four stream bytes).
+ * The modulo is deferred to the end of each 5552-byte block (zlib's NMAX): addition is linear
+ * mod 65521, so the result is identical to reducing after every byte, and the accumulators
+ * stay far below 2^53, so no precision is lost.
+ */
 function adler32(data: Buffer): number {
   const MOD = 65521;
+  const NMAX = 5552;
   let a = 1;
   let b = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    a = (a + (data[i] as number)) % MOD;
-    b = (b + a) % MOD;
+  let offset = 0;
+  while (offset < data.length) {
+    const end = Math.min(offset + NMAX, data.length);
+    for (; offset < end; offset += 1) {
+      a += data[offset] as number;
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
   }
   return ((b << 16) | a) >>> 0;
 }
 
 /**
  * Inflate the object whose zlib stream starts at `offset` and find the stream's end.
- * inflateSync ignores trailing bytes, so one inflate of the tail yields the object; its
- * Adler-32 then marks the stream's end in the compressed bytes (a match is verified by a
- * second inflate, so a coincidental match inside the deflate data cannot fool it). The
- * verified inflate's output is returned, so the caller never inflates the same stream twice.
+ * One inflate of the tail yields the object; the engine reports how many input bytes the
+ * zlib stream consumed, which is the stream's end. The trailing Adler-32 verifies it: the
+ * last four stream bytes must equal the Adler-32 of the output, so a wrong end (or an
+ * engine that reports nothing usable) is caught and the Adler-32 scan below runs instead.
+ * Either way the caller inflates each stream once for its data.
  */
 function inflateObject(pack: Buffer, offset: number, inflatedSize: number): { end: number; data: Buffer } {
+  try {
+    const { buffer: data, engine } = inflateSync(pack.subarray(offset), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: unknown };
+    };
+    if (data.length === inflatedSize && typeof engine.bytesWritten === 'number') {
+      const end = offset + engine.bytesWritten;
+      if (end - 4 >= offset && end <= pack.length && pack.readUInt32BE(end - 4) === adler32(data)) {
+        return { end, data };
+      }
+    }
+  } catch {
+    // Fall through to the scan: a corrupt stream, an engine without a usable byte
+    // count, or an Adler-32 that did not line up.
+  }
   const data = inflateSync(pack.subarray(offset));
   if (data.length !== inflatedSize) throw new Error('pack object size mismatch');
   const needle = Buffer.alloc(4);

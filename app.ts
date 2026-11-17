@@ -130,7 +130,8 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       chunks.push(chunk);
     });
     req.on('end', () => {
-      if (!failed) resolve(Buffer.concat(chunks));
+      // A one-chunk body already is the whole body: Buffer.concat would only copy it.
+      if (!failed) resolve(chunks.length === 0 ? Buffer.alloc(0) : chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks));
     });
     req.on('error', (err) => {
       if (!failed) {
@@ -178,7 +179,15 @@ function pathOf(req: IncomingMessage): string {
 
 /** Split a path into its '/'-separated segments (no empty segments). */
 function segments(path: string): string[] {
-  return path.split('/').filter((part) => part !== '');
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= path.length; i += 1) {
+    if (i === path.length || path[i] === '/') {
+      if (i > start) out.push(path.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return out;
 }
 
 function intParam(query: URLSearchParams, name: string, fallback: number): number {
