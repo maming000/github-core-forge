@@ -64,9 +64,12 @@ function expectedToken(): string {
 
 function bearerToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
-  if (typeof header !== 'string') return null;
-  const match = /^Bearer\s+(.+)$/.exec(header);
-  return match === null ? null : (match[1] as string);
+  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return null;
+  // The old regex /^Bearer\s+(.+)$/ allowed any run of whitespace after Bearer and
+  // kept the rest verbatim; startsWith + trimStart is the same match, without a
+  // regex compile-and-run per request.
+  const token = header.slice(7).trimStart();
+  return token === '' ? null : token;
 }
 
 function isAuthed(req: IncomingMessage): boolean {
@@ -78,14 +81,16 @@ function isAuthed(req: IncomingMessage): boolean {
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   requestCounter += 1;
-  const text = `${JSON.stringify(body)}\n`;
+  // One Buffer.from gives both the bytes and their length; Buffer.byteLength would
+  // re-scan the whole string after stringify already produced it.
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': `req-${requestCounter.toString(16)}`,
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
@@ -145,16 +150,25 @@ function toRecord(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
+/**
+ * The shared empty query set for requests with no '?': constructing a
+ * URLSearchParams per request is pure allocation when nothing reads it, and no
+ * caller ever mutates the object it gets back (linkHeader copies it first).
+ */
+const EMPTY_QUERY = new URLSearchParams('');
 function queryOf(req: IncomingMessage): URLSearchParams {
   const url = req.url ?? '/';
   const index = url.indexOf('?');
-  return new URLSearchParams(index < 0 ? '' : url.slice(index + 1));
+  return index < 0 ? EMPTY_QUERY : new URLSearchParams(url.slice(index + 1));
 }
 
 function pathOf(req: IncomingMessage): string {
   const url = req.url ?? '/';
   const index = url.indexOf('?');
   const raw = index < 0 ? url : url.slice(0, index);
+  // decodeURIComponent is a no-op for paths with no '%' — and every bench/git path
+  // is plain ASCII — so only pay for it when an escape is actually present.
+  if (raw.indexOf('%') < 0) return raw;
   try {
     return decodeURIComponent(raw);
   } catch {
@@ -204,10 +218,10 @@ function linkHeader(req: IncomingMessage, path: string, query: URLSearchParams, 
   return { link: `<http://${host}${path}?${next.toString()}>; rel="next"` };
 }
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+async function handleRest(req: IncomingMessage, res: ServerResponse, path: string, segs: string[]): Promise<void> {
   const method = req.method ?? 'GET';
   const query = queryOf(req);
-  const segs = segments(path); // segs[0..1] are 'api','v3'
+  // segs[0..1] are 'api','v3' (split once by dispatch, not once per layer).
   const rest = segs.slice(2);
 
   // GET /api/v3/ — the API root, with the token's scopes.
@@ -577,6 +591,7 @@ async function handleRepoRest(
       const obj = repo.get(sha);
       if (obj === undefined) return sendJson(res, 422, { message: `object ${sha} does not exist` });
       repo.refs.set(ref, sha);
+      repo.touchGit();
       return sendJson(res, 201, { ref, object: { sha, type: obj.type }, url: `/api/v3/repos/${repo.path}/git/refs/${encodeURIComponent(ref)}` });
     }
     if (tail.length === 4 && tail[2] === 'heads' && method === 'GET') {
@@ -691,6 +706,36 @@ interface AdvertisedRef {
 }
 
 /** All refs of a repo, HEAD first, then branches and tags sorted by name. */
+/**
+ * Look a memoized git smart-HTTP response up on the repo, or build and store it.
+ * The response is a pure function of the repo's refs/objects plus the cache key
+ * (the request's parsed arguments), and every mutation clears the map, so a hit
+ * is always the answer a fresh computation would give. Bounded so a repo that
+ * sees many distinct fetches cannot grow the map without limit.
+ */
+const GIT_CACHE_MAX = 64;
+function gitCached(repo: Repo, key: string, build: () => Buffer): Buffer {
+  const hit = repo.gitCache.get(key);
+  if (hit !== undefined) return hit;
+  const built = build();
+  if (repo.gitCache.size >= GIT_CACHE_MAX) repo.gitCache.clear();
+  repo.gitCache.set(key, built);
+  return built;
+}
+
+/** The v2 info/refs advertisement never depends on repo state: build it once. */
+const INFO_REFS_V2_BODY = Buffer.concat([
+  ...[
+    '# service=git-upload-pack\n',
+    'version 2\n',
+    'agent=github-core-forge/1.0.0\n',
+    'ls-refs=unborn\n',
+    'fetch=shallow\n',
+    'object-format=sha1\n',
+  ].map((line) => pktLine(line)),
+  flushPkt(),
+]);
+
 function advertisementRefs(repo: Repo): AdvertisedRef[] {
   const refs: AdvertisedRef[] = [];
   const tip = repo.refs.get(repo.defaultRef());
@@ -718,34 +763,30 @@ function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, s
   const wantsV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '') === 'version=2';
   const contentType = `application/x-${service}-advertisement`;
   if (wantsV2) {
-    const lines = [
-      '# service=git-upload-pack\n',
-      'version 2\n',
-      'agent=github-core-forge/1.0.0\n',
-      'ls-refs=unborn\n',
-      'fetch=shallow\n',
-      'object-format=sha1\n',
-    ];
-    const body = Buffer.concat([...lines.map((line) => pktLine(line)), flushPkt()]);
-    return sendBuffer(res, 200, body, contentType);
+    return sendBuffer(res, 200, INFO_REFS_V2_BODY, contentType);
   }
-  const refs = advertisementRefs(repo);
-  const caps = v0CapabilityLine(service);
-  const chunks: Buffer[] = [pktLine(`# service=${service}\n`)];
-  const tip = repo.refs.get(repo.defaultRef());
-  if (tip === undefined) {
-    // An unborn repo: the capabilities^{} pseudo-ref carries the capabilities, HEAD is zero.
-    chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-    chunks.push(pktLine(`${ZERO_OID} HEAD\n`));
-  } else {
-    chunks.push(pktLine(`${refs[0]?.oid ?? ZERO_OID} HEAD\0${caps}\n`));
-    for (const ref of refs.slice(1)) {
-      chunks.push(pktLine(`${ref.oid} ${ref.name}\n`));
-      if (ref.peeled !== undefined) chunks.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+  // The v0 advertisement is a pure function of the refs (and tag objects); the
+  // 50 concurrent clones of one repo all ask for the same one.
+  const body = gitCached(repo, `info0|${service}`, () => {
+    const refs = advertisementRefs(repo);
+    const caps = v0CapabilityLine(service);
+    const chunks: Buffer[] = [pktLine(`# service=${service}\n`)];
+    const tip = repo.refs.get(repo.defaultRef());
+    if (tip === undefined) {
+      // An unborn repo: the capabilities^{} pseudo-ref carries the capabilities, HEAD is zero.
+      chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+      chunks.push(pktLine(`${ZERO_OID} HEAD\n`));
+    } else {
+      chunks.push(pktLine(`${refs[0]?.oid ?? ZERO_OID} HEAD\0${caps}\n`));
+      for (const ref of refs.slice(1)) {
+        chunks.push(pktLine(`${ref.oid} ${ref.name}\n`));
+        if (ref.peeled !== undefined) chunks.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+      }
     }
-  }
-  chunks.push(flushPkt());
-  return sendBuffer(res, 200, Buffer.concat(chunks), contentType);
+    chunks.push(flushPkt());
+    return Buffer.concat(chunks);
+  });
+  return sendBuffer(res, 200, body, contentType);
 }
 
 interface FetchPlan {
@@ -824,6 +865,8 @@ function computeFetch(
 
 /** A v2 ls-refs answer: the refs (prefix-filtered), HEAD first when no prefix is given. */
 function handleLsRefs(repo: Repo, args: readonly string[]): Buffer {
+  // Same refs + same arguments = same answer; the clone workload asks 50 times.
+  return gitCached(repo, `lsrefs\n${args.join('\n')}`, () => {
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const prefixes = args.filter((arg) => arg.startsWith('ref-prefix ')).map((arg) => arg.slice('ref-prefix '.length));
@@ -850,10 +893,14 @@ function handleLsRefs(repo: Repo, args: readonly string[]): Buffer {
   const chunks = lines.map((line) => pktLine(line));
   chunks.push(flushPkt());
   return Buffer.concat(chunks);
+  });
 }
 
 /** A v2 fetch answer: acknowledgments, shallow-info, then the packfile section. */
 function handleFetchV2(repo: Repo, args: readonly string[]): Buffer {
+  // The pack for one (wants, haves, shallow, depth) on one repo state is fixed;
+  // the 50 concurrent depth-1 clones of the bench all ask for the same one.
+  return gitCached(repo, `fetch2\n${args.join('\n')}`, () => {
   const wants: string[] = [];
   const haves: string[] = [];
   const clientShallow: string[] = [];
@@ -882,10 +929,12 @@ function handleFetchV2(repo: Repo, args: readonly string[]): Buffer {
   chunks.push(...sidebandChunks(1, plan.pack));
   chunks.push(flushPkt());
   return Buffer.concat(chunks);
+  });
 }
 
 /** A v0 fetch answer: NAK / shallow lines, then the sideband pack. */
 function handleFetchV0(repo: Repo, lines: readonly string[]): Buffer {
+  return gitCached(repo, `fetch0\n${lines.join('\n')}`, () => {
   const wants: string[] = [];
   const haves: string[] = [];
   const clientShallow: string[] = [];
@@ -906,6 +955,12 @@ function handleFetchV0(repo: Repo, lines: readonly string[]): Buffer {
   chunks.push(...sidebandChunks(1, plan.pack));
   chunks.push(flushPkt());
   return Buffer.concat(chunks);
+  });
+}
+
+/** Strip one trailing '\n' from a pkt-line payload: the same as .replace(/\n$/, '') without a regex run per line. */
+function stripNewline(text: string): string {
+  return text.endsWith('\n') ? text.slice(0, -1) : text;
 }
 
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo): Promise<void> {
@@ -919,14 +974,14 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
   try {
     if (wantsV2) {
       const { packets } = parsePktLines(body);
-      const lines = packets.filter((packet) => packet.kind === 'data').map((packet) => packet.payload.toString('utf8').replace(/\n$/, ''));
+      const lines = packets.filter((packet) => packet.kind === 'data').map((packet) => stripNewline(packet.payload.toString('utf8')));
       const commandLine = lines[0] ?? '';
       if (commandLine === 'command=ls-refs') {
         const delimIndex = packets.findIndex((packet) => packet.kind === 'delim');
         const argPackets = delimIndex >= 0 ? packets.slice(delimIndex + 1) : [];
         const args = argPackets
           .filter((packet) => packet.kind === 'data')
-          .map((packet) => packet.payload.toString('utf8').replace(/\n$/, ''));
+          .map((packet) => stripNewline(packet.payload.toString('utf8')));
         return sendBuffer(res, 200, handleLsRefs(repo, args), 'application/x-git-upload-pack-result');
       }
       if (commandLine === 'command=fetch') {
@@ -934,14 +989,14 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
         const argPackets = delimIndex >= 0 ? packets.slice(delimIndex + 1) : [];
         const args = argPackets
           .filter((packet) => packet.kind === 'data')
-          .map((packet) => packet.payload.toString('utf8').replace(/\n$/, ''));
+          .map((packet) => stripNewline(packet.payload.toString('utf8')));
         return sendBuffer(res, 200, handleFetchV2(repo, args), 'application/x-git-upload-pack-result');
       }
       return sendJson(res, 400, { message: `Unknown git command ${JSON.stringify(commandLine)}` });
     }
     // v0: wants (with shallow/deepen) up to the first flush, then haves and done.
     const { packets } = parsePktLines(body);
-    const lines = packets.filter((packet) => packet.kind === 'data').map((packet) => packet.payload.toString('utf8').replace(/\n$/, ''));
+    const lines = packets.filter((packet) => packet.kind === 'data').map((packet) => stripNewline(packet.payload.toString('utf8')));
     if (lines.length === 0 || !lines[0]?.startsWith('want ')) return sendJson(res, 400, { message: 'Expected a want line' });
     return sendBuffer(res, 200, handleFetchV0(repo, lines), 'application/x-git-upload-pack-result');
   } catch (err) {
@@ -959,7 +1014,7 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo
   const { packets, rest } = parsePktLines(body);
   const commandLines = packets
     .filter((packet) => packet.kind === 'data')
-    .map((packet) => packet.payload.toString('utf8').replace(/\n$/, ''));
+    .map((packet) => stripNewline(packet.payload.toString('utf8')));
   interface Command {
     oldOid: string;
     newOid: string;
@@ -1024,6 +1079,8 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo
       report.push(`ok ${command.ref}\n`);
     }
   }
+  // Objects were inserted above and refs moved: any memoized git response is stale.
+  repo.touchGit();
   const reportText = Buffer.from(report.join(''), 'utf8');
   const chunks = sidebandChunks(1, reportText);
   chunks.push(flushPkt());
@@ -1140,14 +1197,14 @@ async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void
     return;
   }
 
-  // REST v3.
+  // REST v3 (segments split once here and reused by the git branch below).
+  const segs = segments(path);
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    await handleRest(req, res, path);
+    await handleRest(req, res, path, segs);
     return;
   }
 
   // Git smart HTTP: /{owner}/{repo}.git/info/refs, /git-upload-pack, /git-receive-pack.
-  const segs = segments(path);
   if (segs.length >= 3 && segs[1]?.endsWith('.git') === true) {
     const owner = segs[0] as string;
     const repoName = (segs[1] as string).slice(0, -4);

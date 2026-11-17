@@ -22,11 +22,16 @@ export const VIEWER_EMAIL = 'adaiversen@example.invalid';
 export const DEFAULT_BRANCH = 'main';
 
 /** The trial's frozen "now": seconds since epoch and the ISO string, from MAKEFUN_TRIAL_NOW. */
+let cachedTrialNow: { epoch: number; iso: string } | null = null;
 export function trialNow(): { epoch: number; iso: string } {
+  if (cachedTrialNow !== null) return cachedTrialNow;
   const raw = process.env.MAKEFUN_TRIAL_NOW ?? '';
   const ms = raw === '' ? Number.NaN : Number(raw);
   const epoch = Number.isFinite(ms) ? Math.floor(ms / 1000) : 1735689600;
-  return { epoch, iso: new Date(epoch * 1000).toISOString() };
+  // The env value is fixed for the life of the process, so the answer never changes:
+  // compute it once instead of allocating a Date and formatting ISO per call.
+  cachedTrialNow = { epoch, iso: new Date(epoch * 1000).toISOString() };
+  return cachedTrialNow;
 }
 
 /** Opaque, stable global id: base64url of a typed key (never the plain databaseId/number). */
@@ -103,6 +108,15 @@ export class Repo implements ObjectWriter {
   pullSeq = 0;
   commentSeq = 0;
   createdAt: string;
+  /**
+   * Memoized git smart-HTTP responses (fetch / ls-refs / info-refs), keyed by the
+   * request's parsed arguments. A fetch answer is a pure function of the repo's refs
+   * and objects plus those arguments, and git objects are immutable, so a cached
+   * answer stays valid until a ref moves or an object is added — both clear this
+   * map (see put() and the refs.set sites). Identical concurrent clones then share
+   * one computed pack instead of each rebuilding it.
+   */
+  gitCache = new Map<string, Buffer>();
 
   constructor(owner: string, name: string, databaseId: number, description: string, isPrivate: boolean, createdAt: string) {
     this.owner = owner;
@@ -120,8 +134,18 @@ export class Repo implements ObjectWriter {
 
   put(type: GitObject['type'], data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      // A new object can change a later fetch answer (a want that was unresolvable
+      // may now resolve), so any memoized git response is stale.
+      this.gitCache.clear();
+    }
     return oid;
+  }
+
+  /** A ref moved (or was created/deleted): any memoized git response is stale. */
+  touchGit(): void {
+    this.gitCache.clear();
   }
 
   get path(): string {
@@ -235,6 +259,7 @@ export function commitFile(
   const commitData = buildCommitData(treeOid, parents, message, now.epoch, VIEWER_LOGIN, VIEWER_EMAIL);
   const commitSha = repo.put('commit', commitData);
   repo.refs.set(refName, commitSha);
+  repo.touchGit();
   return { commitSha, contentSha: blobOid, created };
 }
 
@@ -290,6 +315,7 @@ export function deleteFile(
   const commitData = buildCommitData(treeOid, [tip], message, now.epoch, VIEWER_LOGIN, VIEWER_EMAIL);
   const commitSha = repo.put('commit', commitData);
   repo.refs.set(refName, commitSha);
+  repo.touchGit();
   return { commitSha };
 }
 
@@ -513,6 +539,7 @@ export function mergePull(repo: Repo, pull: Pull): { sha: string } {
   const commitData = buildCommitData(treeOid, [baseTip], message, now.epoch, VIEWER_LOGIN, VIEWER_EMAIL);
   const mergeSha = repo.put('commit', commitData);
   repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  repo.touchGit();
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = now.iso;
