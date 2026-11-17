@@ -378,36 +378,43 @@ export interface ReadPackResult {
   deltaCount: number;
 }
 
+/** Adler-32, the checksum a zlib stream ends with (big-endian, the last four stream bytes). */
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + (data[i] as number)) % MOD;
+    b = (b + a) % MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /**
- * Find the end of the zlib stream starting at `offset`: inflateSync ignores trailing bytes and
- * throws on a truncated stream, so the stream's end is the smallest end that inflates cleanly.
- * The search range is bounded by the object's size (a deflate stream is never much larger than
- * its output), which keeps the binary search to a handful of tiny inflates.
+ * Inflate the object whose zlib stream starts at `offset` and find the stream's end.
+ * inflateSync ignores trailing bytes, so one inflate of the tail yields the object; its
+ * Adler-32 then marks the stream's end in the compressed bytes (a match is verified by a
+ * second inflate, so a coincidental match inside the deflate data cannot fool it). The
+ * verified inflate's output is returned, so the caller never inflates the same stream twice.
  */
-function findZlibEnd(pack: Buffer, offset: number, inflatedSize: number): number {
-  let lo = offset + 1;
-  let hi = Math.min(pack.length, offset + inflatedSize + 64 + Math.floor(inflatedSize / 1000));
-  // The bound must hold: a stored (incompressible) block adds at most 5 bytes per 64 KiB plus
-  // the 6-byte zlib wrapper, so inflatedSize + 64 is generous for any realistic object.
-  const ok = (end: number): boolean => {
+function inflateObject(pack: Buffer, offset: number, inflatedSize: number): { end: number; data: Buffer } {
+  const data = inflateSync(pack.subarray(offset));
+  if (data.length !== inflatedSize) throw new Error('pack object size mismatch');
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  let from = offset + 2;
+  for (;;) {
+    const at = pack.indexOf(needle, from);
+    if (at < 0) throw new Error('cannot locate the end of a pack object stream');
+    const end = at + 4;
     try {
-      const out = inflateSync(pack.subarray(offset, end));
-      return out.length === inflatedSize;
+      const check = inflateSync(pack.subarray(offset, end));
+      if (check.length === inflatedSize) return { end, data: check };
     } catch {
-      return false;
+      // A coincidental Adler-32 inside the deflate data: keep scanning.
     }
-  };
-  if (ok(hi) === false) {
-    // Fall back to the pack's end (minus the 20-byte trailer) if the bound was too tight.
-    hi = pack.length - 20;
-    if (ok(hi) === false) throw new Error('cannot locate the end of a pack object stream');
+    from = at + 1;
   }
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (ok(mid)) hi = mid;
-    else lo = mid + 1;
-  }
-  return lo;
 }
 
 interface PackEntry {
@@ -416,6 +423,7 @@ interface PackEntry {
   size: number;
   dataOffset: number;
   dataEnd: number;
+  data: Buffer;
   baseOffset?: number;
   baseOid?: string;
 }
@@ -465,16 +473,16 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
       offset += 20;
     }
     const dataOffset = offset;
-    const dataEnd = findZlibEnd(pack, dataOffset, size);
+    const { end: dataEnd, data } = inflateObject(pack, dataOffset, size);
     offset = dataEnd;
-    entries.push({ offset: start, typeCode, size, dataOffset, dataEnd, baseOffset, baseOid });
+    entries.push({ offset: start, typeCode, size, dataOffset, dataEnd, data, baseOffset, baseOid });
   }
   const resolve = (entry: PackEntry, seen: Set<number>): GitObject => {
     const cached = byOffset.get(entry.offset);
     if (cached !== undefined) return cached;
     if (seen.has(entry.offset)) throw new Error('delta cycle in packfile');
     seen.add(entry.offset);
-    const inflated = inflateSync(pack.subarray(entry.dataOffset, entry.dataEnd));
+    const inflated = entry.data;
     let result: GitObject;
     if (entry.typeCode === 6 || entry.typeCode === 7) {
       deltaCount += 1;

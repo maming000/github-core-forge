@@ -54,9 +54,12 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const store = new Store();
 let requestCounter = 0;
 
+/** The token the env injects, read once: it is fixed for the life of the process. */
+const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
 /** The token the env injects; when unset (local runs) any non-empty Bearer token is accepted. */
 function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return EXPECTED_TOKEN;
 }
 
 function bearerToken(req: IncomingMessage): string | null {
