@@ -489,7 +489,7 @@ function resolveField(value: TypedValue, field: FieldNode, ctx: Ctx): unknown {
       if (field.name === 'merged') return pull.merged;
       if (field.name === 'headRefName') return pull.headRef;
       if (field.name === 'baseRefName') return pull.baseRef;
-      if (field.name === 'mergeable') return pullMergeable(repo, pull);
+      if (field.name === 'mergeable') return pullMergeable(repo, pull) ? 'MERGEABLE' : 'CONFLICTING';
       if (field.name === 'files') {
         const first = argValue(field, 'first', ctx) as number | undefined;
         const files = pullFiles(repo, pull).map((file) => ({ __type: 'ChangedFile', path: file.filename }));

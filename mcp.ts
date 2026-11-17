@@ -250,14 +250,16 @@ export function handleMcp(store: Store, body: unknown): McpOutcome {
   }
   if (method === 'tools/call') {
     const toolName = typeof params.name === 'string' ? params.name : '';
-    const args = toRecord(params.arguments);
     if (toolName === '') return rpcError(id, -32602, 'tools/call requires a tool name');
+    if (!TOOLS.some((tool) => tool.name === toolName)) {
+      return rpcError(id, -32602, `Unknown tool: ${toolName}`);
+    }
+    const args = toRecord(params.arguments);
     if (Object.keys(args).length === 0) {
       // Tolerate arguments carried directly on params.
       const { name, ...rest } = params;
       void name;
-      const outcome = callTool(store, toolName, rest);
-      return result(id, outcome);
+      return result(id, callTool(store, toolName, rest));
     }
     return result(id, callTool(store, toolName, args));
   }

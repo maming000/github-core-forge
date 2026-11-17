@@ -752,9 +752,36 @@ interface FetchPlan {
 }
 
 /**
+ * The commits a client actually holds for its haves: the ancestors of each have, except that
+ * the walk stops at a shallow boundary — the client holds the boundary commit itself, but not
+ * the boundary's parents (that is what makes a deepen fetch deliver them).
+ */
+function heldCommits(repo: Repo, haves: readonly string[], shallowBoundaries: ReadonlySet<string>): Set<string> {
+  const held = new Set<string>();
+  const stack: string[] = [];
+  for (const have of haves) {
+    const obj = repo.get(have);
+    if (obj === undefined) continue;
+    if (obj.type === 'tag') stack.push(parseTag(obj.data).object);
+    else if (obj.type === 'commit') stack.push(have);
+  }
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (held.has(oid)) continue;
+    const obj = repo.get(oid);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    held.add(oid);
+    if (shallowBoundaries.has(oid)) continue;
+    for (const parent of parseCommit(obj.data).parents) stack.push(parent);
+  }
+  return held;
+}
+
+/**
  * The object set a fetch sends: the closure of the wanted commits (within `depth` generations
- * when given), minus everything reachable from the client's haves. The shallow-info lines are
- * the depth boundary and the client's former boundaries that are now covered.
+ * when given), minus everything reachable from the client's haves. A tag named by a want is
+ * itself part of the pack; a tag named by a have is held. The shallow-info lines are the
+ * depth boundary and the client's former boundaries that are now covered.
  */
 function computeFetch(
   repo: Repo,
@@ -763,11 +790,8 @@ function computeFetch(
   clientShallow: readonly string[],
   depth: number | null,
 ): FetchPlan {
-  const haveCommits = new Set<string>();
-  for (const have of haves) {
-    if (repo.get(have) === undefined) continue;
-    for (const oid of walkCommits(repo, [have], null).included) haveCommits.add(oid);
-  }
+  const shallowSet = new Set(clientShallow);
+  const haveCommits = heldCommits(repo, haves, shallowSet);
   let included: Set<string>;
   let boundary: Set<string> = new Set();
   if (depth !== null) {
@@ -780,6 +804,14 @@ function computeFetch(
   const unshallow = clientShallow.filter((oid) => included.has(oid));
   const wantObjects = objectsForCommits(repo, included);
   const haveObjects = objectsForCommits(repo, haveCommits);
+  for (const want of wants) {
+    const obj = repo.get(want);
+    if (obj !== undefined && obj.type === 'tag') wantObjects.set(want, obj);
+  }
+  for (const have of haves) {
+    const obj = repo.get(have);
+    if (obj !== undefined && obj.type === 'tag') haveObjects.set(have, obj);
+  }
   const packObjects: GitObject[] = [];
   for (const [oid, obj] of [...wantObjects.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     if (!haveObjects.has(oid)) packObjects.push(obj);
@@ -791,15 +823,17 @@ function computeFetch(
 function handleLsRefs(repo: Repo, args: readonly string[]): Buffer {
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
-  const unborn = args.includes('unborn');
   const prefixes = args.filter((arg) => arg.startsWith('ref-prefix ')).map((arg) => arg.slice('ref-prefix '.length));
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   const lines: string[] = [];
   const defaultTip = repo.refs.get(repo.defaultRef());
   if (prefixes.length === 0) {
+    // An unborn repo reports only its HEAD (as unborn, with the symref target): an unborn
+    // branch line of its own would read as an existing ref to callers that filter by name.
     if (defaultTip !== undefined && symrefs) lines.push(`${defaultTip} HEAD symref-target:refs/heads/main\n`);
     else if (defaultTip !== undefined) lines.push(`${defaultTip} HEAD\n`);
-    else if (unborn) lines.push(`unborn HEAD symref-target:refs/heads/main\n`);
+    else if (symrefs) lines.push(`unborn HEAD symref-target:refs/heads/main\n`);
+    else lines.push(`unborn HEAD\n`);
   }
   const names = [...repo.refs.keys()].sort();
   for (const name of names) {
@@ -809,9 +843,6 @@ function handleLsRefs(repo: Repo, args: readonly string[]): Buffer {
     let line = `${oid} ${name}`;
     if (peel && obj !== undefined && obj.type === 'tag') line += ` peeled:${parseTag(obj.data).object}`;
     lines.push(`${line}\n`);
-  }
-  if (defaultTip === undefined && unborn && keep('refs/heads/main')) {
-    lines.push(`unborn refs/heads/main\n`);
   }
   const chunks = lines.map((line) => pktLine(line));
   chunks.push(flushPkt());
