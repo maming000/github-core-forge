@@ -55,6 +55,9 @@ async function register(port: number): Promise<void> {
       if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
+      // A failed attempt is retried forever, so say why: otherwise a process that can never
+      // reach the env waits in silence and there is nothing to diagnose it with.
+      process.stderr.write(`[entry] register attempt ${attempt + 1} failed (${err instanceof Error ? err.message : String(err)}); retrying in ${retryDelay(attempt)} ms\n`);
     }
     await sleep(retryDelay(attempt));
   }
